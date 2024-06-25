@@ -4,11 +4,18 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/dashscope"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/promptTemplate"
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-cache/tairvector"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
+	"github.com/alibaba/tair-go/tair"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
@@ -30,8 +37,8 @@ func main() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
-		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
-		wrapper.ProcessStreamingResponseBodyBy(onHttpResponseBody),
+		//wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
+		//wrapper.ProcessStreamingResponseBodyBy(onHttpResponseBody),
 	)
 }
 
@@ -80,9 +87,47 @@ type RedisInfo struct {
 	// @Title zh-CN 密码
 	// @Description zh-CN 登陆 redis 的密码，非必填，可以只填密码
 	Password string `required:"false" yaml:"password" json:"password"`
+	// @Title zh-CN 索引名称
+	// @Description zh-CN 索引名称
+	IndexName string `required:"true" yaml:"indexName" json:"indexName"`
 	// @Title zh-CN 请求超时
 	// @Description zh-CN 请求 redis 的超时时间，单位为毫秒。默认值是1000，即1秒
 	Timeout int `required:"false" yaml:"timeout" json:"timeout"`
+}
+
+type DashScopeInfo struct {
+	// @Title zh-CN tair 服务名称
+	// @Description zh-CN 带服务类型的完整 FQDN 名称，例如 my-redis.dns、redis.my-ns.svc.cluster.local
+	ServiceName string `required:"true" yaml:"serviceName" json:"serviceName"`
+	// @Title zh-CN tair 服务端口
+	// @Description zh-CN 默认值为6379
+	ServicePort int64 `required:"true" yaml:"servicePort" json:"servicePort"`
+	// @Title zh-CN tair 服务名称
+	// @Description zh-CN 带服务类型的完整 FQDN 名称，例如 my-redis.dns、redis.my-ns.svc.cluster.local
+	Domin string `required:"true" yaml:"domin" json:"domin"`
+	// @Title zh-CN 向量检索服务的key
+	// @Description zh-CN 向量检索服务的key
+	APIKey string `required:"true" yaml:"apiKey" json:"apiKey"`
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type Request struct {
+	Model            string    `json:"model"`
+	Messages         []Message `json:"messages"`
+	FrequencyPenalty float64   `json:"frequency_penalty"`
+	PresencePenalty  float64   `json:"presence_penalty"`
+	Stream           bool      `json:"stream"`
+	Temperature      float64   `json:"temperature"`
+	Topp             int32     `json:"top_p"`
+}
+
+type OutPutFormat struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
 }
 
 type KVExtractor struct {
@@ -96,6 +141,9 @@ type PluginConfig struct {
 	// @Title zh-CN Redis 地址信息
 	// @Description zh-CN 用于存储缓存结果的 Redis 地址
 	RedisInfo RedisInfo `required:"true" yaml:"redis" json:"redis"`
+	// @Title zh-CN dashscope信息
+	// @Description zh-CN 用于存储dashscope使用信息
+	DashScopeInfo DashScopeInfo `required:"true" yaml:"dashscope" json:"dashscope"`
 	// @Title zh-CN 缓存 key 的来源
 	// @Description zh-CN 往 redis 里存时，使用的 key 的提取方式
 	CacheKeyFrom KVExtractor `required:"true" yaml:"cacheKeyFrom" json:"cacheKeyFrom"`
@@ -116,8 +164,9 @@ type PluginConfig struct {
 	CacheTTL int `required:"false" yaml:"cacheTTL" json:"cacheTTL"`
 	// @Title zh-CN Redis缓存Key的前缀
 	// @Description zh-CN 默认值是"higress-ai-cache:"
-	CacheKeyPrefix string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
-	redisClient    wrapper.RedisClient `yaml:"-" json:"-"`
+	CacheKeyPrefix  string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
+	redisClient     wrapper.RedisClient `yaml:"-" json:"-"`
+	DashScopeClient wrapper.HttpClient  `yaml:"-" json:"-"`
 }
 
 func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
@@ -136,6 +185,7 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 	}
 	c.RedisInfo.Username = json.Get("redis.username").String()
 	c.RedisInfo.Password = json.Get("redis.password").String()
+	c.RedisInfo.IndexName = json.Get("redis.indexName").String()
 	c.RedisInfo.Timeout = int(json.Get("redis.timeout").Int())
 	if c.RedisInfo.Timeout == 0 {
 		c.RedisInfo.Timeout = 1000
@@ -168,10 +218,23 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 		FQDN: c.RedisInfo.ServiceName,
 		Port: int64(c.RedisInfo.ServicePort),
 	})
+
+	c.DashScopeInfo.APIKey = json.Get("dashscope.apiKey").String()
+	c.DashScopeInfo.ServiceName = json.Get("dashscope.serviceName").String()
+	c.DashScopeInfo.ServicePort = json.Get("dashscope.servicePort").Int()
+	c.DashScopeInfo.Domin = json.Get("dashscope.domain").String()
+
+	c.DashScopeClient = wrapper.NewClusterClient(wrapper.DnsCluster{
+		ServiceName: c.DashScopeInfo.ServiceName,
+		Port:        c.DashScopeInfo.ServicePort,
+		Domain:      c.DashScopeInfo.Domin,
+	})
+
 	return c.redisClient.Init(c.RedisInfo.Username, c.RedisInfo.Password, int64(c.RedisInfo.Timeout))
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log) types.Action {
+	log.Info("onHttpRequestHeaders")
 	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
 	// The request does not have a body.
 	if contentType == "" {
@@ -192,43 +255,235 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
+func FloatSliceToString(slice []float32) string {
+	strs := make([]string, len(slice))
+	for i, v := range slice {
+		strs[i] = strconv.FormatFloat(float64(v), 'f', -1, 32)
+	}
+	return "[" + strings.Join(strs, ",") + "]"
+}
+
+func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawRequest Request, stream bool, oldmessage []Message, log wrapper.Log) {
+	log.Info("开始转向量了")
+	// text to vector
+	requestEmbedding := dashscope.Request{
+		Model: "text-embedding-v2",
+		Input: dashscope.Input{
+			Texts: []string{key},
+		},
+		Parameter: dashscope.Parameter{
+			TextType: "query",
+		},
+	}
+
+	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
+	reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+	log.Infof("requestEmbedding: ", string(reqEmbeddingSerialized))
+	err := config.DashScopeClient.Post(
+		"/api/v1/services/embeddings/text-embedding/text-embedding",
+		headers,
+		reqEmbeddingSerialized,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			//vector search
+			var responseEmbedding dashscope.Response
+			_ = json.Unmarshal(responseBody, &responseEmbedding)
+			vector := responseEmbedding.Output.Embeddings[0].Embedding
+			sVector := FloatSliceToString(vector)
+
+			log.Infof("sVector:%s", sVector)
+
+			err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.2), func(response resp.Value) {
+				if err := response.Error(); err != nil {
+					log.Errorf("tair search vector:%s failed, err:%v", key, err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				if response.String() == "[]" { // cache miss
+					log.Infof("cache miss not find key:%s", key)
+					//add system role message
+					var systemMessage Message
+					systemMessage.Role = "system"
+					systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Order + promptTemplate.Example
+
+					newMessages := []Message{systemMessage}
+					newMessages = append(newMessages, oldmessage...)
+					rawRequest.Messages = newMessages
+
+					//replace old message and resume request qwen
+					newbody, err := json.Marshal(rawRequest)
+					if err != nil {
+						proxywasm.ResumeHttpRequest()
+						return
+					} else {
+						log.Infof("newbody: ", string(newbody))
+						proxywasm.ReplaceHttpRequestBody(newbody)
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+				}
+
+				//cache hit
+				var knnSearchResp tairvector.KnnSearchResp
+				_ = json.Unmarshal(response.Bytes(), &knnSearchResp)
+
+				log.Debugf("cache hit, key:%s", knnSearchResp.Key)
+				config.redisClient.TvsHGetAll(config.RedisInfo.IndexName, knnSearchResp.Key, func(response resp.Value) {
+					ctx.SetContext(CacheKeyContextKey, nil)
+					var GetAllResp tairvector.GetAllResp
+					_ = json.Unmarshal(response.Bytes(), &GetAllResp)
+					if !stream {
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, GetAllResp.Answer)), -1)
+					} else {
+						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, GetAllResp.Answer)), -1)
+					}
+				})
+			})
+			if err != nil {
+				log.Error("key search failed")
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			proxywasm.ResumeHttpRequest()
+		}, 50000)
+	if err != nil {
+		log.Infof("向量转错了：", err.Error())
+	}
+}
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
-	bodyJson := gjson.ParseBytes(body)
-	// TODO: It may be necessary to support stream mode determination for different LLM providers.
+	log.Info("onHttpRequestBody")
+	var rawRequest Request
+	_ = json.Unmarshal(body, &rawRequest)
 	stream := false
-	if bodyJson.Get("stream").Bool() {
+	if rawRequest.Stream {
 		stream = true
 		ctx.SetContext(StreamContextKey, struct{}{})
 	} else if ctx.GetContext(StreamContextKey) != nil {
 		stream = true
 	}
-	key := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
+
+	messageLength := len(rawRequest.Messages)
+	key := rawRequest.Messages[messageLength-1].Content
+	log.Infof("key: ", key)
 	if key == "" {
 		log.Debug("parse key from request body failed")
 		return types.ActionContinue
 	}
 	ctx.SetContext(CacheKeyContextKey, key)
-	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
+	log.Infof("IndexName: ", config.RedisInfo.IndexName)
+	//get tairvector index
+	err := config.redisClient.TvsGetIndex(config.RedisInfo.IndexName, func(response resp.Value) {
+		log.Infof("TvsGetIndex: ", response.String())
 		if err := response.Error(); err != nil {
-			log.Errorf("redis get key:%s failed, err:%v", key, err)
+			log.Errorf("tair get index:%s failed, err:%v", key, err)
 			proxywasm.ResumeHttpRequest()
 			return
 		}
-		if response.IsNull() {
-			log.Debugf("cache miss, key:%s", key)
-			proxywasm.ResumeHttpRequest()
-			return
+
+		if response.String() == "[]" { //not find index
+			log.Infof("not find index:%s", config.RedisInfo.IndexName)
+			//create index
+			config.redisClient.TvsCreateIndex(config.RedisInfo.IndexName, 1536, "HNSW", "l2", nil, func(response resp.Value) {
+				SearchVector(ctx, config, key, rawRequest, stream, rawRequest.Messages, log)
+				proxywasm.ResumeHttpRequest()
+			})
+		} else { //find index
+			log.Infof("find index:%s", config.RedisInfo.IndexName)
+			//SearchVector(ctx, config, key, rawRequest, stream, rawRequest.Messages, log)
+			//proxywasm.ResumeHttpRequest()
+			log.Info("开始转向量了")
+			// text to vector
+			requestEmbedding := dashscope.Request{
+				Model: "text-embedding-v2",
+				Input: dashscope.Input{
+					Texts: []string{key},
+				},
+				Parameter: dashscope.Parameter{
+					TextType: "query",
+				},
+			}
+
+			headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
+			reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+			log.Infof("requestEmbedding: ", string(reqEmbeddingSerialized))
+			err := config.DashScopeClient.Post(
+				"/api/v1/services/embeddings/text-embedding/text-embedding",
+				headers,
+				reqEmbeddingSerialized,
+				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					//vector search
+					var responseEmbedding dashscope.Response
+					_ = json.Unmarshal(responseBody, &responseEmbedding)
+					vector := responseEmbedding.Output.Embeddings[0].Embedding
+					sVector := FloatSliceToString(vector)
+
+					log.Infof("sVector:%s", sVector)
+
+					err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.2), func(response resp.Value) {
+						if err := response.Error(); err != nil {
+							log.Errorf("tair search vector:%s failed, err:%v", key, err)
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+						if response.String() == "[]" { // cache miss
+							log.Infof("cache miss not find key:%s", key)
+							//add system role message
+							var systemMessage Message
+							systemMessage.Role = "system"
+							systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Order + promptTemplate.Example
+
+							newMessages := []Message{systemMessage}
+							newMessages = append(newMessages, rawRequest.Messages...)
+							rawRequest.Messages = newMessages
+
+							//replace old message and resume request qwen
+							newbody, err := json.Marshal(rawRequest)
+							if err != nil {
+								proxywasm.ResumeHttpRequest()
+								return
+							} else {
+								log.Infof("newbody: ", string(newbody))
+								err := proxywasm.ReplaceHttpRequestBody(newbody)
+								if err != nil {
+									log.Info("替换失败")
+								}
+								log.Info("替换成功")
+								proxywasm.ResumeHttpRequest()
+								return
+							}
+						}
+
+						//cache hit
+						var knnSearchResp tairvector.KnnSearchResp
+						_ = json.Unmarshal(response.Bytes(), &knnSearchResp)
+
+						log.Debugf("cache hit, key:%s", knnSearchResp.Key)
+						config.redisClient.TvsHGetAll(config.RedisInfo.IndexName, knnSearchResp.Key, func(response resp.Value) {
+							ctx.SetContext(CacheKeyContextKey, nil)
+							var GetAllResp tairvector.GetAllResp
+							_ = json.Unmarshal(response.Bytes(), &GetAllResp)
+							if !stream {
+								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, GetAllResp.Answer)), -1)
+							} else {
+								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, GetAllResp.Answer)), -1)
+							}
+						})
+					})
+					if err != nil {
+						log.Error("key search failed")
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+					proxywasm.ResumeHttpRequest()
+				}, 50000)
+			if err != nil {
+				log.Infof("向量转错了：", err.Error())
+			}
 		}
-		log.Debugf("cache hit, key:%s", key)
-		ctx.SetContext(CacheKeyContextKey, nil)
-		if !stream {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
-		} else {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
-		}
+		proxywasm.ResumeHttpRequest()
 	})
 	if err != nil {
-		log.Error("redis access failed")
+		log.Error("get index failed")
 		return types.ActionContinue
 	}
 	return types.ActionPause
@@ -321,7 +576,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 		return chunk
 	}
 	// last chunk
-	key := keyI.(string)
+	//key := keyI.(string)
 	stream := ctx.GetContext(StreamContextKey)
 	var value string
 	if stream == nil {
@@ -363,9 +618,43 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 			value = tempContentI.(string)
 		}
 	}
-	config.redisClient.Set(config.CacheKeyPrefix+key, value, nil)
-	if config.CacheTTL != 0 {
-		config.redisClient.Expire(config.CacheKeyPrefix+key, config.CacheTTL, nil)
+
+	var output OutPutFormat
+	if value != "" {
+		err := json.Unmarshal([]byte(value), &output)
+		if err == nil {
+			//text to vector
+			requestEmbedding := dashscope.Request{
+				Model: "text-embedding-v2",
+				Input: dashscope.Input{
+					Texts: []string{output.Question, output.Answer},
+				},
+				Parameter: dashscope.Parameter{
+					TextType: "query",
+				},
+			}
+			headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
+			reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+			config.DashScopeClient.Post(
+				"/api/v1/services/embeddings/text-embedding/text-embedding",
+				headers,
+				reqEmbeddingSerialized,
+				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					var responseEmbedding dashscope.Response
+					_ = json.Unmarshal(responseBody, &responseEmbedding)
+					vector := responseEmbedding.Output.Embeddings[0].Embedding
+					sVector := FloatSliceToString(vector)
+
+					fields := make(map[string]interface{})
+					fields["VECTOR"] = sVector
+					fields["question"] = output.Question
+					fields["answer"] = output.Answer
+
+					config.redisClient.TvsHSet(config.RedisInfo.IndexName, output.Question, tair.TvsHSetArgs{}.New().Fields(fields), nil)
+					proxywasm.ResumeHttpResponse()
+				})
+		}
 	}
+
 	return chunk
 }

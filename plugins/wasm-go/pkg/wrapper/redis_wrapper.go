@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/alibaba/tair-go/tair"
 	"github.com/google/uuid"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tidwall/resp"
@@ -100,6 +101,13 @@ type RedisClient interface {
 	ZRem(key string, members []string, callback RedisResponseCallback) error
 	ZRange(key string, start, stop int, callback RedisResponseCallback) error
 	ZRevRange(key string, start, stop int, callback RedisResponseCallback) error
+
+	// Vector
+	TvsCreateIndex(name string, dim int, indexType string, distanceType string, a *tair.TvsCreateIndexArgs, callback RedisResponseCallback) error
+	TvsGetIndex(name string, callback RedisResponseCallback) error
+	TvsHSet(index string, key string, a *tair.TvsHSetArgs, callback RedisResponseCallback) error
+	TvsKnnSearch(index string, topN int, vector string, a *tair.TvsKnnSearchArgs, callback RedisResponseCallback) error
+	TvsHGetAll(index string, key string, callback RedisResponseCallback) error
 }
 
 type RedisClusterClient[C Cluster] struct {
@@ -662,5 +670,54 @@ func (c RedisClusterClient[C]) ZRevRange(key string, start, stop int, callback R
 	args = append(args, key)
 	args = append(args, start)
 	args = append(args, stop)
+	return RedisCall(c.cluster, respString(args), callback)
+}
+
+func (c RedisClusterClient[C]) TvsCreateIndex(name string, dim int, indexType string, distanceType string, a *tair.TvsCreateIndexArgs, callback RedisResponseCallback) error {
+	args := make([]interface{}, 5)
+	args[0] = "TVS.CREATEINDEX"
+	args[1] = name
+	args[2] = dim
+	args[3] = indexType
+	args[4] = distanceType
+	if a != nil {
+		args = append(args, a.GetArgs()...)
+	}
+	return RedisCall(c.cluster, respString(args), callback)
+}
+
+func (c RedisClusterClient[C]) TvsGetIndex(name string, callback RedisResponseCallback) error {
+	args := make([]interface{}, 2)
+	args[0] = "TVS.GETINDEX"
+	args[1] = name
+	return RedisCall(c.cluster, respString(args), callback)
+}
+
+func (c RedisClusterClient[C]) TvsHSet(index string, key string, a *tair.TvsHSetArgs, callback RedisResponseCallback) error {
+	args := make([]interface{}, 3)
+	args[0] = "TVS.HSET"
+	args[1] = index
+	args[2] = key
+	args = append(args, a.GetArgs()...)
+	return RedisCall(c.cluster, respString(args), callback)
+}
+
+func (c RedisClusterClient[C]) TvsKnnSearch(index string, topN int, vector string, a *tair.TvsKnnSearchArgs, callback RedisResponseCallback) error {
+	args := make([]interface{}, 4)
+	args[0] = "TVS.KNNSEARCH"
+	args[1] = index
+	args[2] = topN
+	args[3] = vector
+	if a != nil {
+		args = append(args, a.GetArgs()...)
+	}
+	return RedisCall(c.cluster, respString(args), callback)
+}
+
+func (c RedisClusterClient[C]) TvsHGetAll(index string, key string, callback RedisResponseCallback) error {
+	args := make([]interface{}, 3)
+	args[0] = "TVS.HGETALL"
+	args[1] = index
+	args[2] = key
 	return RedisCall(c.cluster, respString(args), callback)
 }
