@@ -37,8 +37,9 @@ func main() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
-		//wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
+		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
 		//wrapper.ProcessStreamingResponseBodyBy(onHttpResponseBody),
+		wrapper.ProcessResponseBodyBy(onHttpResponseBody),
 	)
 }
 
@@ -123,6 +124,27 @@ type Request struct {
 	Stream           bool      `json:"stream"`
 	Temperature      float64   `json:"temperature"`
 	Topp             int32     `json:"top_p"`
+}
+
+type Choice struct {
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	FinishReason string  `json:"finish_reason"`
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type Response struct {
+	ID      string   `json:"id"`
+	Choices []Choice `json:"choices"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Object  string   `json:"object"`
+	Usage   Usage    `json:"usage"`
 }
 
 type OutPutFormat struct {
@@ -263,7 +285,7 @@ func FloatSliceToString(slice []float32) string {
 	return "[" + strings.Join(strs, ",") + "]"
 }
 
-func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawRequest Request, stream bool, oldmessage []Message, log wrapper.Log) {
+func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawRequest Request, stream bool, log wrapper.Log) {
 	log.Info("开始转向量了")
 	// text to vector
 	requestEmbedding := dashscope.Request{
@@ -278,7 +300,6 @@ func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawR
 
 	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
 	reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
-	log.Infof("requestEmbedding: ", string(reqEmbeddingSerialized))
 	err := config.DashScopeClient.Post(
 		"/api/v1/services/embeddings/text-embedding/text-embedding",
 		headers,
@@ -290,23 +311,22 @@ func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawR
 			vector := responseEmbedding.Output.Embeddings[0].Embedding
 			sVector := FloatSliceToString(vector)
 
-			log.Infof("sVector:%s", sVector)
-
-			err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.2), func(response resp.Value) {
+			err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.3), func(response resp.Value) {
 				if err := response.Error(); err != nil {
 					log.Errorf("tair search vector:%s failed, err:%v", key, err)
 					proxywasm.ResumeHttpRequest()
 					return
 				}
+
 				if response.String() == "[]" { // cache miss
 					log.Infof("cache miss not find key:%s", key)
 					//add system role message
 					var systemMessage Message
 					systemMessage.Role = "system"
-					systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Order + promptTemplate.Example
+					systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Example
 
 					newMessages := []Message{systemMessage}
-					newMessages = append(newMessages, oldmessage...)
+					newMessages = append(newMessages, rawRequest.Messages...)
 					rawRequest.Messages = newMessages
 
 					//replace old message and resume request qwen
@@ -316,34 +336,40 @@ func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawR
 						return
 					} else {
 						log.Infof("newbody: ", string(newbody))
-						proxywasm.ReplaceHttpRequestBody(newbody)
+						err := proxywasm.ReplaceHttpRequestBody(newbody)
+						if err != nil {
+							log.Info("替换失败")
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, "替换失败"+err.Error())), -1)
+						}
+						log.Info("替换成功")
 						proxywasm.ResumeHttpRequest()
-						return
 					}
+				} else {
+					//cache hit
+					trimmedResponse := strings.Trim(response.String(), "[]")
+					log.Infof("cache hit, trimmedResponse:%s", trimmedResponse)
+					firstKey := strings.Split(trimmedResponse, "0.")[0]
+
+					log.Infof("cache hit, key:%s", firstKey)
+					config.redisClient.TvsHGetAll(config.RedisInfo.IndexName, firstKey, func(response resp.Value) {
+						ctx.SetContext(CacheKeyContextKey, nil)
+						log.Infof("TvsHGetAll: %s", response.String())
+						var GetAllResp tairvector.GetAllResp
+						_ = json.Unmarshal(response.Bytes(), &GetAllResp)
+						if !stream {
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, GetAllResp.Answer)), -1)
+						} else {
+							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, GetAllResp.Answer)), -1)
+						}
+					})
 				}
-
-				//cache hit
-				var knnSearchResp tairvector.KnnSearchResp
-				_ = json.Unmarshal(response.Bytes(), &knnSearchResp)
-
-				log.Debugf("cache hit, key:%s", knnSearchResp.Key)
-				config.redisClient.TvsHGetAll(config.RedisInfo.IndexName, knnSearchResp.Key, func(response resp.Value) {
-					ctx.SetContext(CacheKeyContextKey, nil)
-					var GetAllResp tairvector.GetAllResp
-					_ = json.Unmarshal(response.Bytes(), &GetAllResp)
-					if !stream {
-						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, GetAllResp.Answer)), -1)
-					} else {
-						proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, GetAllResp.Answer)), -1)
-					}
-				})
 			})
 			if err != nil {
 				log.Error("key search failed")
 				proxywasm.ResumeHttpRequest()
 				return
 			}
-			proxywasm.ResumeHttpRequest()
+			//	proxywasm.ResumeHttpRequest()
 		}, 50000)
 	if err != nil {
 		log.Infof("向量转错了：", err.Error())
@@ -354,142 +380,58 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	log.Info("onHttpRequestBody")
 	var rawRequest Request
 	_ = json.Unmarshal(body, &rawRequest)
+
 	stream := false
+
 	if rawRequest.Stream {
 		stream = true
 		ctx.SetContext(StreamContextKey, struct{}{})
 	} else if ctx.GetContext(StreamContextKey) != nil {
+
 		stream = true
 	}
 
 	messageLength := len(rawRequest.Messages)
 	key := rawRequest.Messages[messageLength-1].Content
 	log.Infof("key: ", key)
+
 	if key == "" {
 		log.Debug("parse key from request body failed")
 		return types.ActionContinue
 	}
+
 	ctx.SetContext(CacheKeyContextKey, key)
 	log.Infof("IndexName: ", config.RedisInfo.IndexName)
 	//get tairvector index
+
 	err := config.redisClient.TvsGetIndex(config.RedisInfo.IndexName, func(response resp.Value) {
 		log.Infof("TvsGetIndex: ", response.String())
 		if err := response.Error(); err != nil {
 			log.Errorf("tair get index:%s failed, err:%v", key, err)
 			proxywasm.ResumeHttpRequest()
-			return
 		}
 
 		if response.String() == "[]" { //not find index
 			log.Infof("not find index:%s", config.RedisInfo.IndexName)
 			//create index
 			config.redisClient.TvsCreateIndex(config.RedisInfo.IndexName, 1536, "HNSW", "l2", nil, func(response resp.Value) {
-				SearchVector(ctx, config, key, rawRequest, stream, rawRequest.Messages, log)
-				proxywasm.ResumeHttpRequest()
+				SearchVector(ctx, config, key, rawRequest, stream, log)
 			})
 		} else { //find index
 			log.Infof("find index:%s", config.RedisInfo.IndexName)
-			//SearchVector(ctx, config, key, rawRequest, stream, rawRequest.Messages, log)
-			//proxywasm.ResumeHttpRequest()
-			log.Info("开始转向量了")
-			// text to vector
-			requestEmbedding := dashscope.Request{
-				Model: "text-embedding-v2",
-				Input: dashscope.Input{
-					Texts: []string{key},
-				},
-				Parameter: dashscope.Parameter{
-					TextType: "query",
-				},
-			}
-
-			headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
-			reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
-			log.Infof("requestEmbedding: ", string(reqEmbeddingSerialized))
-			err := config.DashScopeClient.Post(
-				"/api/v1/services/embeddings/text-embedding/text-embedding",
-				headers,
-				reqEmbeddingSerialized,
-				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-					//vector search
-					var responseEmbedding dashscope.Response
-					_ = json.Unmarshal(responseBody, &responseEmbedding)
-					vector := responseEmbedding.Output.Embeddings[0].Embedding
-					sVector := FloatSliceToString(vector)
-
-					log.Infof("sVector:%s", sVector)
-
-					err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.2), func(response resp.Value) {
-						if err := response.Error(); err != nil {
-							log.Errorf("tair search vector:%s failed, err:%v", key, err)
-							proxywasm.ResumeHttpRequest()
-							return
-						}
-						if response.String() == "[]" { // cache miss
-							log.Infof("cache miss not find key:%s", key)
-							//add system role message
-							var systemMessage Message
-							systemMessage.Role = "system"
-							systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Order + promptTemplate.Example
-
-							newMessages := []Message{systemMessage}
-							newMessages = append(newMessages, rawRequest.Messages...)
-							rawRequest.Messages = newMessages
-
-							//replace old message and resume request qwen
-							newbody, err := json.Marshal(rawRequest)
-							if err != nil {
-								proxywasm.ResumeHttpRequest()
-								return
-							} else {
-								log.Infof("newbody: ", string(newbody))
-								err := proxywasm.ReplaceHttpRequestBody(newbody)
-								if err != nil {
-									log.Info("替换失败")
-								}
-								log.Info("替换成功")
-								proxywasm.ResumeHttpRequest()
-								return
-							}
-						}
-
-						//cache hit
-						var knnSearchResp tairvector.KnnSearchResp
-						_ = json.Unmarshal(response.Bytes(), &knnSearchResp)
-
-						log.Debugf("cache hit, key:%s", knnSearchResp.Key)
-						config.redisClient.TvsHGetAll(config.RedisInfo.IndexName, knnSearchResp.Key, func(response resp.Value) {
-							ctx.SetContext(CacheKeyContextKey, nil)
-							var GetAllResp tairvector.GetAllResp
-							_ = json.Unmarshal(response.Bytes(), &GetAllResp)
-							if !stream {
-								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, GetAllResp.Answer)), -1)
-							} else {
-								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, GetAllResp.Answer)), -1)
-							}
-						})
-					})
-					if err != nil {
-						log.Error("key search failed")
-						proxywasm.ResumeHttpRequest()
-						return
-					}
-					proxywasm.ResumeHttpRequest()
-				}, 50000)
-			if err != nil {
-				log.Infof("向量转错了：", err.Error())
-			}
+			SearchVector(ctx, config, key, rawRequest, stream, log)
 		}
-		proxywasm.ResumeHttpRequest()
 	})
+
 	if err != nil {
 		log.Error("get index failed")
 		return types.ActionContinue
 	}
+
 	return types.ActionPause
 }
 
-func processSSEMessage(ctx wrapper.HttpContext, config PluginConfig, sseMessage string, log wrapper.Log) string {
+/*func processSSEMessage(ctx wrapper.HttpContext, config PluginConfig, sseMessage string, log wrapper.Log) string {
 	subMessages := strings.Split(sseMessage, "\n")
 	var message string
 	for _, msg := range subMessages {
@@ -522,7 +464,7 @@ func processSSEMessage(ctx wrapper.HttpContext, config PluginConfig, sseMessage 
 	}
 	log.Debugf("unknown message:%s", bodyJson)
 	return ""
-}
+}*/
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log) types.Action {
 	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
@@ -532,7 +474,78 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log wra
 	return types.ActionContinue
 }
 
-func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
+func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
+	var rawResponse Response
+	err := json.Unmarshal(body, &rawResponse)
+	if err != nil {
+		return types.ActionContinue
+	}
+	var output OutPutFormat
+	if rawResponse.Choices[0].Message.Content != "" {
+		err := json.Unmarshal([]byte(rawResponse.Choices[0].Message.Content), &output)
+		if err == nil {
+			log.Infof("question: ", output.Question)
+			log.Infof("answer: ", output.Answer)
+			//text to vector
+			requestEmbedding := dashscope.Request{
+				Model: "text-embedding-v2",
+				Input: dashscope.Input{
+					Texts: []string{output.Question, output.Answer},
+				},
+				Parameter: dashscope.Parameter{
+					TextType: "query",
+				},
+			}
+			headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.DashScopeInfo.APIKey}}
+			reqEmbeddingSerialized, _ := json.Marshal(requestEmbedding)
+			config.DashScopeClient.Post(
+				"/api/v1/services/embeddings/text-embedding/text-embedding",
+				headers,
+				reqEmbeddingSerialized,
+				func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					var responseEmbedding dashscope.Response
+					_ = json.Unmarshal(responseBody, &responseEmbedding)
+					vector := responseEmbedding.Output.Embeddings[0].Embedding
+					sVector := FloatSliceToString(vector)
+
+					fields := make(map[string]interface{})
+					fields["VECTOR"] = sVector
+					fields["question"] = output.Question
+					fields["answer"] = output.Answer
+
+					config.redisClient.TvsHSet(config.RedisInfo.IndexName, output.Question, tair.TvsHSetArgs{}.New().Fields(fields), nil)
+
+					var assistantMessage Message
+					assistantMessage.Role = "assistant"
+					assistantMessage.Content = output.Answer
+					rawResponse.Choices[0].Message = assistantMessage
+
+					//replace old message and resume request qwen
+					newbody, err := json.Marshal(rawResponse)
+					if err != nil {
+						proxywasm.ResumeHttpResponse()
+						return
+					} else {
+						log.Infof("newbody: ", string(newbody))
+						proxywasm.ReplaceHttpResponseBody(newbody)
+
+						log.Info("替换成功")
+						proxywasm.ResumeHttpResponse()
+					}
+
+					//proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, output.Answer)), -1)
+				})
+		} else {
+			return types.ActionContinue
+		}
+	} else {
+		return types.ActionContinue
+	}
+
+	return types.ActionPause
+}
+
+/*func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
 	if ctx.GetContext(ToolCallsContextKey) != nil {
 		// we should not cache tool call result
 		return chunk
@@ -658,3 +671,4 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 
 	return chunk
 }
+*/
