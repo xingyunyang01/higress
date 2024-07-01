@@ -20,12 +20,10 @@ const OutputFormat = `
 `
 
 const Order = `
-请注意：在我的提问中，可能会出现有歧义的问题，比如缺少主语，谓语或宾语等，但是相信聪明的你通过对于上文User的理解，是可以将其转化成无歧义的问题的。
+请注意：在我的提问中，可能会出现有歧义的问题，比如缺少主语，谓语或宾语等，再比如会出现代词，例如这种，那种等，所以此时你要将这类问题结合history中hunman和AI的问答进行理解，并将问题改写成无歧义的问题。一定要一步步的分析history想清楚了。
 例如：
-User: Higress可以替换kubernetes吗？
-Assistant：{"question":"Higress可以替换kubernetes吗？", "answer":"xxxx"}
-User: Nginx Ingress呢？
-此时这个"Nginx Ingress呢？"，就有歧义，但通过理解上文的提问，我们可以得知，它的意思是Higress可以替换Nginx Ingress吗？，所以此时你要这么给我返回：
+User: history: human: Higress可以替换kubernetes吗？AI: xxxxx。question: Nginx Ingress呢？
+此时这个"Nginx Ingress呢？"，就有歧义，但通过对history的分析，我们可以得知，它的意思是Higress可以替换Nginx Ingress吗？，所以此时你要这么给我返回：
 Assistant：{"question":"Higress可以替换Nginx Ingress吗？", "answer":"xxxx"}
 `
 
@@ -38,14 +36,20 @@ Assistant：{"question":"今天天气怎么样？", "answer":"抱歉，我无法
 example2：
 User: Higress可以替换kubernetes吗？
 Assistant：{"question":"Higress可以替换kubernetes吗？", "answer":"xxxx"}
-User: Nginx Ingress呢？
+User: history: human: Higress可以替换kubernetes吗？AI: xxxxx。question: Nginx Ingress呢？
 Assistant：{"question":"Higress可以替换Nginx Ingress吗？", "answer":"xxxx"}
 
 example3：
 User: 可以动态修改Higress的Wasm插件逻辑吗？
 Assistant：{"question":"可以动态修改Higress的Wasm插件逻辑吗？", "answer":"xxxx"}
-User: 怎么操作呢？
+User: history: human: 可以动态修改Higress的Wasm插件逻辑吗？AI: xxxxx。question: 怎么操作呢？
 Assistant：{"question":"怎么动态修改Higress的Wasm插件逻辑呢？", "answer":"xxxx"}
+
+example4：
+User: 可以动态修改Higress的Wasm插件逻辑吗？
+Assistant：{"question":"可以动态修改Higress的Wasm插件逻辑吗？", "answer":"xxxx"}
+User: history: human: 可以动态修改Higress的Wasm插件逻辑吗？AI: xxxxx。question: 这种方式好不好？
+Assistant：{"question":"动态修改Higress的Wasm插件的方式好不好", "answer":"xxxx"}
 `
 
 // example4：

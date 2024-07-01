@@ -14,6 +14,13 @@ require (
 )
 
 require (
+	github.com/cespare/xxhash/v2 v2.1.2 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/go-redis/redis/v8 v8.11.5 // indirect
+)
+
+require (
+	github.com/alibaba/tair-go v1.2.0
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/higress-group/nottinygc v0.0.0-20231101025119-e93c4c2f8520 // indirect
 	github.com/magefile/mage v1.14.0 // indirect

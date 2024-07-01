@@ -316,7 +316,7 @@ func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawR
 
 			err := config.redisClient.TvsKnnSearch(config.RedisInfo.IndexName, 1, sVector, tair.TvsKnnSearchArgs{}.New().MaxDist(0.25), func(response resp.Value) {
 				if err := response.Error(); err != nil {
-					log.Errorf("tair search vector:%s failed, err:%v", key, err)
+					log.Errorf("[onHttpRequestBody] tair search vector:%s failed, err:%v", key, err)
 					proxywasm.ResumeHttpRequest()
 					return
 				}
@@ -330,42 +330,74 @@ func SearchVector(ctx wrapper.HttpContext, config PluginConfig, key string, rawR
 					systemMessage.Role = "system"
 					systemMessage.Content = promptTemplate.Instruction + promptTemplate.OutputFormat + promptTemplate.Order + promptTemplate.Example
 
-					//只取一条历史对话
-					if len(rawRequest.Messages) >= 3 {
-						// 用于存储最终格式化后的字符串
-						formattedHistory := "history: "
-
-						userkey := len(rawRequest.Messages) - 3
-						assistantkey := len(rawRequest.Messages) - 2
-						questionkey := len(rawRequest.Messages) - 1
-						if (rawRequest.Messages[userkey].Role == "user") && (rawRequest.Messages[assistantkey].Role == "assistant") {
-							formattedHistory += " human:" + rawRequest.Messages[userkey].Content
-							formattedHistory += " AI:" + rawRequest.Messages[assistantkey].Content
-
-							formattedHistory += " question:" + rawRequest.Messages[questionkey].Content
-							rawRequest.Messages[questionkey].Content = formattedHistory
+					//从redis中获取上一个问题
+					config.redisClient.Get("lastquestion", func(response resp.Value) {
+						if err := response.Error(); err != nil {
+							log.Errorf("[onHttpRequestBody] redis get key:%s failed, err:%v", "lastquestion", err)
 						}
-					}
+						if response.IsNull() {
+							log.Infof("[onHttpRequestBody] cache miss, key:%s", "lastquestion")
 
-					newMessages := []Message{systemMessage}
-					newMessages = append(newMessages, rawRequest.Messages...)
-					rawRequest.Messages = newMessages
+							newMessages := []Message{systemMessage}
+							newMessages = append(newMessages, rawRequest.Messages...)
+							rawRequest.Messages = newMessages
 
-					//replace old message and resume request qwen
-					newbody, err := json.Marshal(rawRequest)
-					if err != nil {
-						proxywasm.ResumeHttpRequest()
-						return
-					} else {
-						log.Infof("[onHttpRequestBody] newRequestBody: ", string(newbody))
-						err := proxywasm.ReplaceHttpRequestBody(newbody)
-						if err != nil {
-							log.Info("替换失败")
-							proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, "替换失败"+err.Error())), -1)
+							//replace old message and resume request qwen
+							newbody, err := json.Marshal(rawRequest)
+							if err != nil {
+								proxywasm.ResumeHttpRequest()
+								return
+							} else {
+								log.Infof("[onHttpRequestBody] newRequestBody: ", string(newbody))
+								err := proxywasm.ReplaceHttpRequestBody(newbody)
+								if err != nil {
+									log.Info("替换失败")
+									proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, "替换失败"+err.Error())), -1)
+								}
+								log.Info("[onHttpRequestBody] request替换成功")
+								proxywasm.ResumeHttpRequest()
+							}
 						}
-						log.Info("[onHttpRequestBody] request替换成功")
-						proxywasm.ResumeHttpRequest()
-					}
+
+						log.Debugf("[onHttpRequestBody] cache hit, key:%s", "lastquestion")
+						lastquestion := response.String()
+						config.redisClient.Get("lastanswer", func(response resp.Value) {
+							if err := response.Error(); err != nil {
+								log.Errorf("[onHttpRequestBody] redis get key:%s failed, err:%v", "lastanswer", err)
+							}
+
+							if response.IsNull() {
+								log.Infof("[onHttpRequestBody] cache miss, key:%s", "lastanswer")
+							}
+
+							log.Debugf("[onHttpRequestBody] cache hit, key:%s", "lastanswer")
+
+							historyPromptTemplate := "history: human:%s AI:%s question:%s"
+
+							prompt := fmt.Sprintf(historyPromptTemplate, lastquestion, response.String(), key)
+							rawRequest.Messages[len(rawRequest.Messages)-1].Content = prompt
+
+							newMessages := []Message{systemMessage}
+							newMessages = append(newMessages, rawRequest.Messages...)
+							rawRequest.Messages = newMessages
+
+							//replace old message and resume request qwen
+							newbody, err := json.Marshal(rawRequest)
+							if err != nil {
+								proxywasm.ResumeHttpRequest()
+								return
+							} else {
+								log.Infof("[onHttpRequestBody] newRequestBody: ", string(newbody))
+								err := proxywasm.ReplaceHttpRequestBody(newbody)
+								if err != nil {
+									log.Info("替换失败")
+									proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, "替换失败"+err.Error())), -1)
+								}
+								log.Info("[onHttpRequestBody] request替换成功")
+								proxywasm.ResumeHttpRequest()
+							}
+						})
+					})
 				} else {
 					//cache hit
 					knnresp := response.Array()
@@ -612,6 +644,16 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byt
 				err := config.redisClient.TvsHSet(config.RedisInfo.IndexName, question, tair.TvsHSetArgs{}.New().Fields(fields), nil)
 				if err != nil {
 					log.Infof("[onHttpResponseBody] TvsHSet err: %s", err.Error())
+				}
+
+				err = config.redisClient.Set("lastquestion", question, nil)
+				if err != nil {
+					log.Infof("[onHttpResponseBody] Set lastquestion err: %s", err.Error())
+				}
+
+				err = config.redisClient.Set("lastanswer", answer, nil)
+				if err != nil {
+					log.Infof("[onHttpResponseBody] Set lastanswer err: %s", err.Error())
 				}
 
 				var assistantMessage Message
